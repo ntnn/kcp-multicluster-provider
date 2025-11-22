@@ -51,8 +51,10 @@ var _ multicluster.ProviderRunnable = &Provider{}
 
 type Clusters = clusters.Clusters[cluster.Cluster]
 
-func NewClusters() *Clusters {
+func NewClusters(log logr.Logger) *Clusters {
 	c := clusters.New[cluster.Cluster]()
+	c.LogHandler = log.Info
+	c.ErrorHandler = log.Error
 	return &c
 }
 

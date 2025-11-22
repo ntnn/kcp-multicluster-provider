@@ -2,6 +2,8 @@ module github.com/kcp-dev/multicluster-provider
 
 go 1.24.0
 
+replace sigs.k8s.io/multicluster-runtime => ../multicluster-runtime
+
 require (
 	github.com/go-logr/logr v1.4.2
 	github.com/hashicorp/golang-lru/v2 v2.0.7

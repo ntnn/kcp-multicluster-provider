@@ -116,7 +116,7 @@ func New(cfg *rest.Config, endpointSliceName string, options Options) (*Provider
 	}
 
 	return &Provider{
-		clusters:  provider.NewClusters(),
+		clusters:  provider.NewClusters(*options.Log),
 		providers: map[string]*provider.Provider{},
 
 		config: cfg,

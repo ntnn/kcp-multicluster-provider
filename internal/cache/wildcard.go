@@ -34,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/multicluster-runtime/pkg/clusters"
 
 	kcpcache "github.com/kcp-dev/apimachinery/v2/pkg/cache"
 	kcpinformers "github.com/kcp-dev/apimachinery/v2/third_party/informers"
@@ -82,6 +83,7 @@ func NewWildcardCache(config *rest.Config, opts cache.Options) (WildcardCache, e
 		},
 
 		readerFailOnMissingInformer: opts.ReaderFailOnMissingInformer,
+		indexes:                     []*clusters.Index{},
 	}
 
 	opts.NewInformer = func(watcher k8scache.ListerWatcher, obj runtime.Object, duration time.Duration, indexers k8scache.Indexers) k8scache.SharedIndexInformer {
@@ -125,6 +127,8 @@ type wildcardCache struct {
 	tracker informerTracker
 
 	readerFailOnMissingInformer bool
+
+	indexes []*clusters.Index
 }
 
 func (c *wildcardCache) GetSharedInformer(obj runtime.Object) (k8scache.SharedIndexInformer, schema.GroupVersionKind, apimeta.RESTScopeName, error) {
@@ -181,7 +185,20 @@ func (c *wildcardCache) GetSharedInformer(obj runtime.Object) (k8scache.SharedIn
 
 // IndexField adds an index for the given object kind.
 func (c *wildcardCache) IndexField(ctx context.Context, obj client.Object, field string, extractValue client.IndexerFunc) error {
-	return c.Cache.IndexField(ctx, obj, "cluster/"+field, func(obj client.Object) []string {
+	for _, index := range c.indexes {
+		if index.Object == obj && index.Field == field {
+			// already indexed
+			return nil
+		}
+	}
+
+	c.indexes = append(c.indexes, &clusters.Index{
+		Object:    obj,
+		Field:     field,
+		Extractor: extractValue,
+	})
+
+	return c.Cache.IndexField(ctx, obj, field, func(obj client.Object) []string {
 		keys := extractValue(obj)
 		withCluster := make([]string, len(keys)*2)
 		for i, key := range keys {

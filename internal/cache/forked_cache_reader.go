@@ -271,9 +271,9 @@ func objectKeyToStoreKey(k client.ObjectKey) string {
 // fieldIndexName constructs the name of the index over the given field,
 // for use with an indexer.
 func fieldIndexName(clusterAware bool, field string) string {
-	if clusterAware {
-		return "field:cluster/" + field
-	}
+	// if clusterAware {
+	// 	return "field:cluster/" + field
+	// }
 	return "field:" + field
 }
 
