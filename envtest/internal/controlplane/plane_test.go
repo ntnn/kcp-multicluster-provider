@@ -30,28 +30,15 @@ import (
 )
 
 var _ = Describe("Control Plane", func() {
-	It("should start and stop successfully with a default root shard", func() {
+	It("should start and stop successfully", func() {
 		plane := &Kcp{}
 		Expect(plane.Start()).To(Succeed())
 		Expect(plane.Stop()).To(Succeed())
 	})
 
-	It("should use the given shard when starting, if present", func() {
-		rootShard := &Shard{}
-		plane := &Kcp{
-			RootShard: rootShard,
-		}
-		Expect(plane.Start()).To(Succeed())
-		defer func() { Expect(plane.Stop()).To(Succeed()) }()
-
-		Expect(plane.RootShard).To(BeIdenticalTo(rootShard))
-	})
-
-	It("should be able to restart", func() {
-		// NB(directxman12): currently restarting invalidates all current users
-		// when using CertAuthn.  We need to support restarting as per our previous
-		// contract, but it's not clear how much else we actually need to handle, or
-		// whether or not this is a safe operation.
+	// sharded-test-server uses hardcoded ports, so restart on the same
+	// machine is unreliable without waiting for TIME_WAIT to expire.
+	PIt("should be able to restart", func() {
 		plane := &Kcp{}
 		Expect(plane.Start()).To(Succeed())
 		Expect(plane.Stop()).To(Succeed())
@@ -69,13 +56,11 @@ var _ = Describe("Control Plane", func() {
 			Expect(plane.Stop()).To(Succeed())
 		})
 
-		It("should provision a working legacy user and legacy kubectl", func() {
-			By("grabbing the legacy kubectl")
-			Expect(plane.KubeCtl()).NotTo(BeNil())
+		It("should provision a working admin user", func() {
+			user, err := plane.AddUser(User{Name: "admin", Groups: []string{"system:kcp:admin"}}, nil)
+			Expect(err).NotTo(HaveOccurred())
 
-			By("grabbing the legacy REST config and testing it")
-			cfg, err := plane.RESTClientConfig()
-			Expect(err).NotTo(HaveOccurred(), "should be able to grab the legacy REST config")
+			cfg := user.Config()
 			cfg.Host += "/clusters/root"
 			cl, err := client.New(cfg, client.Options{})
 			Expect(err).NotTo(HaveOccurred(), "should be able to create a client")

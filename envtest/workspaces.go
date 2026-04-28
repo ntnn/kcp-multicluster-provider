@@ -22,6 +22,8 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/martinlindhe/base36"
@@ -97,6 +99,61 @@ func WithNamePrefix(prefix string) WorkspaceOption {
 	}
 }
 
+// testWorkspaceCount maps test names to a running atomic counter of how
+// many workspaces the test created.
+var testWorkspaceCount sync.Map
+
+// WithSpreadAcrossShards ensures that workspaces are spread across the
+// available shards unless the workspace has an explicit location set.
+func WithSpreadAcrossShards(t TestingT, shardNames []string) WorkspaceOption {
+	require.NotEmpty(t, shardNames, "WithSpreadAcrossShards requires at least one shard to schedule workspaces on")
+
+	storedValue, loaded := testWorkspaceCount.LoadOrStore(t.Name(), &atomic.Uint64{})
+	if !loaded {
+		t.Cleanup(func() {
+			testWorkspaceCount.Delete(t.Name())
+		})
+	}
+
+	counter := storedValue.(*atomic.Uint64)
+
+	return func(ws *tenancyv1alpha1.Workspace) {
+		if ws.Spec.Location != nil {
+			return
+		}
+
+		idx := int(counter.Add(1) - 1) //nolint:gosec
+		targetShard := shardNames[idx%len(shardNames)]
+		WithShard(targetShard)(ws)
+	}
+}
+
+// ShardNames returns the names of all shards in the cluster.
+func ShardNames(t TestingT, clusterClient kcpclient.ClusterClient) []string {
+	t.Helper()
+
+	ctx, cancelFunc := context.WithCancel(context.Background())
+	t.Cleanup(cancelFunc)
+
+	shards := &corev1alpha1.ShardList{}
+	require.NoError(t, clusterClient.Cluster(core.RootCluster.Path()).List(ctx, shards), "failed to list shards")
+	require.NotEmpty(t, shards.Items, "no shards found")
+
+	names := make([]string, 0, len(shards.Items))
+	for _, shard := range shards.Items {
+		names = append(names, shard.Name)
+	}
+	return names
+}
+
+var cachedShardNames sync.Map
+
+func shardNamesForClient(t TestingT, clusterClient kcpclient.ClusterClient) []string {
+	t.Helper()
+	stored, _ := cachedShardNames.LoadOrStore("shardNames", ShardNames(t, clusterClient))
+	return stored.([]string)
+}
+
 // NewWorkspaceFixture creates a new workspace under the given parent
 // using the given client.
 func NewWorkspaceFixture(t TestingT, clusterClient kcpclient.ClusterClient, parent logicalcluster.Path, options ...WorkspaceOption) (*tenancyv1alpha1.Workspace, logicalcluster.Path) {
@@ -104,6 +161,8 @@ func NewWorkspaceFixture(t TestingT, clusterClient kcpclient.ClusterClient, pare
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	t.Cleanup(cancelFunc)
+
+	options = append(options, WithSpreadAcrossShards(t, shardNamesForClient(t, clusterClient)))
 
 	ws := &tenancyv1alpha1.Workspace{
 		ObjectMeta: metav1.ObjectMeta{
@@ -177,6 +236,8 @@ func NewInitializingWorkspaceFixture(t TestingT, clusterClient kcpclient.Cluster
 
 	ctx, cancelFunc := context.WithCancel(context.Background())
 	t.Cleanup(cancelFunc)
+
+	options = append(options, WithSpreadAcrossShards(t, shardNamesForClient(t, clusterClient)))
 
 	ws := &tenancyv1alpha1.Workspace{
 		ObjectMeta: metav1.ObjectMeta{

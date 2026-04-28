@@ -19,7 +19,18 @@ set -euo pipefail
 cd $(dirname $0)/..
 source hack/lib.sh
 
-export TEST_ASSET_KCP="$(UGET_PRINT_PATH=absolute make --no-print-directory install-kcp)"
-export CGO_ENABLED=1
+# export TEST_ASSET_SHARDED_TEST_SERVER="$(UGET_PRINT_PATH=absolute make --no-print-directory install-sharded-test-server)"
+# export TEST_ASSET_KCP="$(UGET_PRINT_PATH=absolute make --no-print-directory install-kcp)"
+# export TEST_ASSET_KCP_FRONT_PROXY="$(UGET_PRINT_PATH=absolute make --no-print-directory install-kcp-front-proxy)"
+# export TEST_ASSET_CACHE_SERVER="$(UGET_PRINT_PATH=absolute make --no-print-directory install-cache-server)"
+
+export TEST_KCP_NUM_SHARDS="${NUM_SHARDS:-1}"
+export CGO_ENABLED=0
+
+# TODO: remove once released artifacts are available upstream
+export TEST_ASSET_SHARDED_TEST_SERVER="$(realpath "$(pwd)/_tools/sharded-test-server")"
+export TEST_ASSET_KCP="$(realpath "$(pwd)/_tools/kcp")"
+export TEST_ASSET_KCP_FRONT_PROXY="$(realpath "$(pwd)/_tools/kcp-front-proxy")"
+export TEST_ASSET_CACHE_SERVER="$(realpath "$(pwd)/_tools/cache-server")"
 
 go_test unit_tests -short -tags "unit" -timeout 20m -race -v ./...

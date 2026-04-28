@@ -16,12 +16,6 @@ limitations under the License.
 
 package certs
 
-// NB(directxman12): nothing has verified that this has good settings.  In fact,
-// the setting generated here are probably terrible, but they're fine for integration
-// tests.  These ABSOLUTELY SHOULD NOT ever be exposed in the public API.  They're
-// ONLY for use with envtest's ability to configure webhook testing.
-// If I didn't otherwise not want to add a dependency on cfssl, I'd just use that.
-
 import (
 	"crypto"
 	"crypto/ecdsa"
@@ -32,10 +26,8 @@ import (
 	"encoding/pem"
 	"fmt"
 	"math/big"
-	"net"
+	"os"
 	"time"
-
-	certutil "k8s.io/client-go/util/cert"
 )
 
 var (
@@ -75,8 +67,7 @@ func (k CertPair) AsBytes() (cert []byte, key []byte, err error) {
 	return cert, key, nil
 }
 
-// TinyCA supports signing serving certs and client-certs,
-// and can be used as an auth mechanism with envtest.
+// TinyCA supports signing client-certs and can be used as an auth mechanism with envtest.
 type TinyCA struct {
 	CA      CertPair
 	orgName string
@@ -84,36 +75,69 @@ type TinyCA struct {
 	nextSerial *big.Int
 }
 
-// newPrivateKey generates a new private key of a relatively sane size (see
-// rsaKeySize).
-func newPrivateKey() (crypto.Signer, error) {
-	return ecdsa.GenerateKey(ellipticCurve, crand.Reader)
-}
-
-// NewTinyCA creates a new a tiny CA utility for provisioning serving certs and client certs FOR TESTING ONLY.
-// Don't use this for anything else!
-func NewTinyCA() (*TinyCA, error) {
-	caPrivateKey, err := newPrivateKey()
+// LoadTinyCA loads an existing CA from cert and key files on disk.
+func LoadTinyCA(certPath, keyPath string) (*TinyCA, error) {
+	certPEM, err := os.ReadFile(certPath)
 	if err != nil {
-		return nil, fmt.Errorf("unable to generate private key for CA: %w", err)
+		return nil, fmt.Errorf("unable to read CA cert: %w", err)
 	}
-	caCfg := certutil.Config{CommonName: "envtest-environment", Organization: []string{"envtest"}}
-	caCert, err := certutil.NewSelfSignedCACert(caCfg, caPrivateKey)
+	keyPEM, err := os.ReadFile(keyPath)
 	if err != nil {
-		return nil, fmt.Errorf("unable to generate certificate for CA: %w", err)
+		return nil, fmt.Errorf("unable to read CA key: %w", err)
+	}
+
+	certBlock, _ := pem.Decode(certPEM)
+	if certBlock == nil {
+		return nil, fmt.Errorf("unable to decode CA cert PEM")
+	}
+	caCert, err := x509.ParseCertificate(certBlock.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("unable to parse CA cert: %w", err)
+	}
+
+	keyBlock, _ := pem.Decode(keyPEM)
+	if keyBlock == nil {
+		return nil, fmt.Errorf("unable to decode CA key PEM")
+	}
+	caKey, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+	if err != nil {
+		rsaKey, rsaErr := x509.ParsePKCS1PrivateKey(keyBlock.Bytes)
+		if rsaErr == nil {
+			caKey = rsaKey
+		} else {
+			ecKey, ecErr := x509.ParseECPrivateKey(keyBlock.Bytes)
+			if ecErr != nil {
+				return nil, fmt.Errorf("unable to parse CA key: %w", err)
+			}
+			caKey = ecKey
+		}
+	}
+
+	signer, ok := caKey.(crypto.Signer)
+	if !ok {
+		return nil, fmt.Errorf("CA key does not implement crypto.Signer")
 	}
 
 	return &TinyCA{
-		CA:         CertPair{Key: caPrivateKey, Cert: caCert},
+		CA:         CertPair{Key: signer, Cert: caCert},
 		orgName:    "envtest",
 		nextSerial: big.NewInt(1),
 	}, nil
 }
 
-func (c *TinyCA) makeCert(cfg certutil.Config) (CertPair, error) {
+// ClientInfo describes some Kubernetes user for the purposes of creating
+// client certificates.
+type ClientInfo struct {
+	Name   string
+	Groups []string
+}
+
+// NewClientCert produces a new CertPair suitable for use with Kubernetes
+// client cert auth with an API server validating based on this CA.
+func (c *TinyCA) NewClientCert(user ClientInfo) (CertPair, error) {
 	now := time.Now()
 
-	key, err := newPrivateKey()
+	key, err := ecdsa.GenerateKey(ellipticCurve, crand.Reader)
 	if err != nil {
 		return CertPair{}, fmt.Errorf("unable to create private key: %w", err)
 	}
@@ -122,20 +146,12 @@ func (c *TinyCA) makeCert(cfg certutil.Config) (CertPair, error) {
 	c.nextSerial.Add(c.nextSerial, bigOne)
 
 	template := x509.Certificate{
-		Subject:      pkix.Name{CommonName: cfg.CommonName, Organization: cfg.Organization},
-		DNSNames:     cfg.AltNames.DNSNames,
-		IPAddresses:  cfg.AltNames.IPs,
+		Subject:      pkix.Name{CommonName: user.Name, Organization: user.Groups},
 		SerialNumber: serial,
-
-		KeyUsage:    x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
-		ExtKeyUsage: cfg.Usages,
-
-		// technically not necessary for testing, but let's set anyway just in case.
-		NotBefore: now.UTC(),
-		// 1 week -- the default for cfssl, and just long enough for a
-		// long-term test, but not too long that anyone would try to use this
-		// seriously.
-		NotAfter: now.Add(168 * time.Hour).UTC(),
+		KeyUsage:     x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+		NotBefore:    now.UTC(),
+		NotAfter:     now.Add(168 * time.Hour).UTC(),
 	}
 
 	certRaw, err := x509.CreateCertificate(crand.Reader, &template, c.CA.Cert, key.Public(), c.CA.Key)
@@ -152,73 +168,4 @@ func (c *TinyCA) makeCert(cfg certutil.Config) (CertPair, error) {
 		Key:  key,
 		Cert: cert,
 	}, nil
-}
-
-// NewServingCert returns a new CertPair for a serving HTTPS on localhost (or other specified names).
-func (c *TinyCA) NewServingCert(names ...string) (CertPair, error) {
-	if len(names) == 0 {
-		names = []string{"localhost"}
-	}
-	dnsNames, ips, err := resolveNames(names)
-	if err != nil {
-		return CertPair{}, err
-	}
-
-	return c.makeCert(certutil.Config{
-		CommonName:   "localhost",
-		Organization: []string{c.orgName},
-		AltNames: certutil.AltNames{
-			DNSNames: dnsNames,
-			IPs:      ips,
-		},
-		Usages: []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
-	})
-}
-
-// ClientInfo describes some Kubernetes user for the purposes of creating
-// client certificates.
-type ClientInfo struct {
-	// Name is the user name (embedded as the cert's CommonName)
-	Name string
-	// Groups are the groups to which this user belongs (embedded as the cert's
-	// Organization)
-	Groups []string
-}
-
-// NewClientCert produces a new CertPair suitable for use with Kubernetes
-// client cert auth with an API server validating based on this CA.
-func (c *TinyCA) NewClientCert(user ClientInfo) (CertPair, error) {
-	return c.makeCert(certutil.Config{
-		CommonName:   user.Name,
-		Organization: user.Groups,
-		Usages:       []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
-	})
-}
-
-func resolveNames(names []string) ([]string, []net.IP, error) {
-	dnsNames := []string{}
-	ips := []net.IP{}
-	for _, name := range names {
-		if name == "" {
-			continue
-		}
-		ip := net.ParseIP(name)
-		if ip == nil {
-			dnsNames = append(dnsNames, name)
-			// Also resolve to IPs.
-			nameIPs, err := net.LookupHost(name)
-			if err != nil {
-				return nil, nil, err
-			}
-			for _, nameIP := range nameIPs {
-				ip = net.ParseIP(nameIP)
-				if ip != nil {
-					ips = append(ips, ip)
-				}
-			}
-		} else {
-			ips = append(ips, ip)
-		}
-	}
-	return dnsNames, ips, nil
 }

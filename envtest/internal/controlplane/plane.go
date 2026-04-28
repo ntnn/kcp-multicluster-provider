@@ -17,206 +17,311 @@ limitations under the License.
 package controlplane
 
 import (
+	"context"
 	"fmt"
+	"io"
+	"maps"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
 
-	kerrors "k8s.io/apimachinery/pkg/util/errors"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+	ctrllog "sigs.k8s.io/controller-runtime/pkg/log"
+
+	"github.com/kcp-dev/multicluster-provider/envtest/internal/certs"
+	"github.com/kcp-dev/multicluster-provider/envtest/internal/process"
 )
 
-// Kcp is a struct that knows how to start your test kcp.
-//
-// Right now, that means one kcp shard. This is likely to increase in
-// future.
-type Kcp struct {
-	RootShard *Shard
+var log = ctrllog.Log.WithName("controlplane")
 
-	// Kubectl will override the default asset search path for kubectl
+// Kcp manages a sharded-test-server process that runs one or more kcp shards
+// with a front-proxy.
+type Kcp struct {
+	// Path is the path to the sharded-test-server binary.
+	// Discovered via BinPathFinder("sharded-test-server", ...) if empty.
+	Path string
+
+	// NumberOfShards is the total shard count (including root). Default: 1.
+	NumberOfShards int
+
+	// WorkDir is the working directory for sharded-test-server.
+	// If empty, a temp dir is created and cleaned on Stop().
+	WorkDir string
+
+	// BinaryAssetsDirectory is used to locate kcp, kcp-front-proxy, and
+	// cache-server binaries needed by sharded-test-server.
+	BinaryAssetsDirectory string
+
+	// StartTimeout is the maximum time to wait for the server to become ready.
+	StartTimeout time.Duration
+
+	// StopTimeout is the maximum time to wait for the server to stop.
+	StopTimeout time.Duration
+
+	// Out, Err specify where sharded-test-server should write its stdout/stderr.
+	// If not specified, the output will be discarded.
+	Out io.Writer
+	Err io.Writer
+
+	// Args are additional flags passed to sharded-test-server.
+	Args []string
+
+	// KubectlPath will override the default asset search path for kubectl.
 	KubectlPath string
 
-	// for the deprecated methods (Kubectl, etc)
-	defaultUserCfg     *rest.Config
-	defaultUserKubectl *KubeCtl
+	cmd              *exec.Cmd
+	workDir          string
+	dirNeedsCleaning bool
 }
 
-// Start will start your kcp processes. To stop them, call Stop().
-func (f *Kcp) Start() (retErr error) {
-	if f.RootShard == nil {
-		f.RootShard = &Shard{}
+// Start launches the sharded-test-server process and waits for it to become ready.
+func (k *Kcp) Start() error {
+	if k.Path == "" {
+		k.Path = process.BinPathFinder("sharded-test-server", k.BinaryAssetsDirectory)
 	}
-	if err := f.RootShard.Start(); err != nil {
+	if k.NumberOfShards <= 0 {
+		k.NumberOfShards = 1
+	}
+	if k.StartTimeout == 0 {
+		k.StartTimeout = 2 * time.Minute
+	}
+	if k.StopTimeout == 0 {
+		k.StopTimeout = 20 * time.Second
+	}
+
+	if k.workDir == "" {
+		if k.WorkDir != "" {
+			k.workDir = k.WorkDir
+		} else {
+			dir, err := os.MkdirTemp("", "kcp_envtest_")
+			if err != nil {
+				return fmt.Errorf("unable to create work directory: %w", err)
+			}
+			k.workDir = dir
+			k.dirNeedsCleaning = true
+		}
+	}
+
+	args := []string{ //nolint:prealloc // preallocating for three more items is premature optimization
+		"--number-of-shards=" + strconv.Itoa(k.NumberOfShards),
+		"--work-dir-path=" + k.workDir,
+		"--quiet",
+	}
+	args = append(args, k.Args...)
+
+	k.cmd = exec.Command(k.Path, args...)
+	k.cmd.SysProcAttr = process.GetSysProcAttr()
+	k.cmd.Stdout = k.Out
+	k.cmd.Stderr = k.Err
+	k.cmd.Env = k.buildEnv()
+
+	log.Info("starting sharded-test-server", "command", k.Path, "args", args)
+
+	if err := k.cmd.Start(); err != nil {
+		return fmt.Errorf("unable to start sharded-test-server: %w", err)
+	}
+
+	if err := k.waitForReady(); err != nil {
+		_ = k.Stop()
 		return err
 	}
-	defer func() {
-		if retErr != nil {
-			_ = f.RootShard.Stop()
-		}
-	}()
 
-	// provision the default user -- can be removed when the related
-	// methods are removed.  The default user has admin permissions to
-	// mimic legacy no-authz setups.
-	user, err := f.AddUser(User{Name: "default", Groups: []string{"system:kcp:admin"}}, &rest.Config{})
-	if err != nil {
-		return fmt.Errorf("unable to provision the default (legacy) user: %w", err)
-	}
-	kubectl, err := user.Kubectl()
-	if err != nil {
-		return fmt.Errorf("unable to provision the default (legacy) kubeconfig: %w", err)
-	}
-	f.defaultUserCfg = user.Config()
-	f.defaultUserKubectl = kubectl
 	return nil
 }
 
-// Stop will stop your kcp processes, and clean up their data.
-func (f *Kcp) Stop() error {
-	var errList []error
+// Stop terminates the sharded-test-server process and cleans up the work directory.
+func (k *Kcp) Stop() error {
+	defer func() {
+		if k.dirNeedsCleaning && k.workDir != "" {
+			_ = os.RemoveAll(k.workDir)
+			k.workDir = ""
+		}
+	}()
 
-	if f.RootShard != nil {
-		if err := f.RootShard.Stop(); err != nil {
-			errList = append(errList, err)
+	if k.cmd == nil || k.cmd.Process == nil {
+		return nil
+	}
+
+	// Kill the process group so all children (shards, front-proxy, cache) are terminated.
+	if err := syscall.Kill(-k.cmd.Process.Pid, syscall.SIGTERM); err != nil {
+		// Process may already be gone.
+		if err != syscall.ESRCH {
+			return fmt.Errorf("unable to signal sharded-test-server to stop: %w", err)
 		}
 	}
 
-	return kerrors.NewAggregate(errList)
+	done := make(chan error, 1)
+	go func() {
+		done <- k.cmd.Wait()
+	}()
+
+	select {
+	case <-done:
+		return nil
+	case <-time.After(k.StopTimeout):
+		_ = syscall.Kill(-k.cmd.Process.Pid, syscall.SIGKILL)
+		return fmt.Errorf("timeout waiting for sharded-test-server to stop")
+	}
 }
 
-// KubeCtl returns a pre-configured KubeCtl, ready to connect to this
-// Kcp.
-//
-// Deprecated: use AddUser & AuthenticatedUser.Kubectl instead.
-func (f *Kcp) KubeCtl() *KubeCtl {
-	return f.defaultUserKubectl
+// AdminKubeconfigPath returns the path to the admin kubeconfig generated by
+// the sharded-test-server.
+func (k *Kcp) AdminKubeconfigPath() string {
+	return filepath.Join(k.workDir, ".kcp", "admin.kubeconfig")
 }
 
-// RESTClientConfig returns a pre-configured restconfig, ready to connect to
-// this Kcp.
-//
-// Deprecated: use AddUser & AuthenticatedUser.Config instead.
-func (f *Kcp) RESTClientConfig() (*rest.Config, error) {
-	return f.defaultUserCfg, nil
+// RESTConfig loads the admin kubeconfig and returns a *rest.Config pointing
+// to the front-proxy (base context, no /clusters/ prefix).
+func (k *Kcp) RESTConfig() (*rest.Config, error) {
+	loader := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+		&clientcmd.ClientConfigLoadingRules{ExplicitPath: k.AdminKubeconfigPath()},
+		&clientcmd.ConfigOverrides{CurrentContext: "base"},
+	)
+	return loader.ClientConfig()
 }
 
-// AuthenticatedUser contains access information for an provisioned user,
-// including REST config, kubeconfig contents, and access to a KubeCtl instance.
-//
-// It's not "safe" to use the methods on this till after the API server has been
-// started (due to certificate initialization and such).  The various methods will
-// panic if this is done.
+// User represents a Kubernetes user.
+type User struct {
+	Name   string
+	Groups []string
+}
+
+// AuthenticatedUser contains access information for a provisioned user.
 type AuthenticatedUser struct {
-	// cfg is the rest.Config for connecting to the API server.  It's lazily initialized.
-	cfg *rest.Config
-	// cfgIsComplete indicates the cfg has had late-initialized fields (e.g.
-	// API server CA data) initialized.
-	cfgIsComplete bool
-
-	// apiServer is a handle to the Shard that's used when finalizing cfg
-	// and producing the kubectl instance.
-	plane *Kcp
-
-	// kubectl is our existing, provisioned kubectl.  We don't provision one
-	// till someone actually asks for it.
-	kubectl *KubeCtl
+	cfg  *rest.Config
+	kcp  *Kcp
+	name string
 }
 
-// Config returns the REST config that can be used to connect to the API server
-// as this user.
-//
-// Will panic if used before the API server is started.
+// Config returns the REST config for this user.
 func (u *AuthenticatedUser) Config() *rest.Config {
-	// NB(directxman12): we choose to panic here for ergonomics sake, and because there's
-	// not really much you can do to "handle" this error.  This machinery is intended to be
-	// used in tests anyway, so panicing is not a particularly big deal.
-	if u.cfgIsComplete {
-		return u.cfg
-	}
-	if len(u.plane.RootShard.SecureServing.CA) == 0 {
-		panic("the API server has not yet been started, please do that before accessing connection details")
-	}
-
-	u.cfg.CAData = u.plane.RootShard.SecureServing.CA
-	u.cfg.Host = u.plane.RootShard.SecureServing.URL("https", "/").String()
-	u.cfgIsComplete = true
 	return u.cfg
 }
 
-// KubeConfig returns a KubeConfig that's roughly equivalent to this user's REST config.
-//
-// Will panic if used before the API server is started.
-func (u AuthenticatedUser) KubeConfig() ([]byte, error) {
-	// NB(directxman12): we don't return the actual API object to avoid yet another
-	// piece of kubernetes API in our public API, and also because generally the thing
-	// you want to do with this is just write it out to a file for external debugging
-	// purposes, etc.
-	return KubeConfigFromREST(u.Config())
+// KubeConfig returns a serialized kubeconfig for this user.
+func (u *AuthenticatedUser) KubeConfig() ([]byte, error) {
+	return KubeConfigFromREST(u.cfg)
 }
 
-// Kubectl returns a KubeCtl instance for talking to the API server as this user.  It uses
-// a kubeconfig equivalent to that returned by .KubeConfig.
-//
-// Will panic if used before the API server is started.
+// Kubectl returns a KubeCtl instance for this user.
 func (u *AuthenticatedUser) Kubectl() (*KubeCtl, error) {
-	if u.kubectl != nil {
-		return u.kubectl, nil
-	}
-	if len(u.plane.RootShard.RootDir) == 0 {
-		panic("the API server has not yet been started, please do that before accessing connection details")
-	}
-
-	// cleaning this up is handled when our tmpDir is deleted
-	out, err := os.CreateTemp(u.plane.RootShard.RootDir, "*.kubecfg")
+	out, err := os.CreateTemp(u.kcp.workDir, "*.kubecfg")
 	if err != nil {
 		return nil, fmt.Errorf("unable to create file for kubeconfig: %w", err)
 	}
 	defer out.Close()
-	contents, err := KubeConfigFromREST(u.Config())
+	contents, err := KubeConfigFromREST(u.cfg)
 	if err != nil {
 		return nil, err
 	}
 	if _, err := out.Write(contents); err != nil {
-		return nil, fmt.Errorf("unable to write kubeconfig to disk at %s: %w", out.Name(), err)
+		return nil, fmt.Errorf("unable to write kubeconfig to disk: %w", err)
 	}
-	k := &KubeCtl{
-		Path: u.plane.KubectlPath,
+	kubectl := &KubeCtl{
+		Path: u.kcp.KubectlPath,
 	}
-	k.Opts = append(k.Opts, fmt.Sprintf("--kubeconfig=%s", out.Name()))
-	u.kubectl = k
-	return k, nil
+	kubectl.Opts = append(kubectl.Opts, fmt.Sprintf("--kubeconfig=%s", out.Name()))
+	return kubectl, nil
 }
 
-// AddUser provisions a new user in the cluster.  It uses the Shard's authentication
-// strategy -- see Shard.SecureServing.Authn.
-//
-// Unlike AddUser, it's safe to pass a nil rest.Config here if you have no
-// particular opinions about the config.
-//
-// The default authentication strategy is not guaranteed to any specific strategy, but it is
-// guaranteed to be callable both before and after Start has been called (but, as noted in the
-// AuthenticatedUser docs, the given user objects are only valid after Start has been called).
-func (f *Kcp) AddUser(user User, baseConfig *rest.Config) (*AuthenticatedUser, error) {
-	if f.GetRootShard().SecureServing.Authn == nil {
-		return nil, fmt.Errorf("no API server authentication is configured yet.  The API server defaults one when Start is called, did you mean to use that?")
+// AddUser provisions a new user by issuing a client certificate from the
+// kcp cluster's client CA.
+func (k *Kcp) AddUser(user User, baseConfig *rest.Config) (*AuthenticatedUser, error) {
+	if k.workDir == "" {
+		return nil, fmt.Errorf("kcp has not been started yet")
 	}
 
-	if baseConfig == nil {
-		baseConfig = &rest.Config{}
-	}
-	cfg, err := f.GetRootShard().SecureServing.AddUser(user, baseConfig)
+	ca, err := certs.LoadTinyCA(
+		filepath.Join(k.workDir, ".kcp", "client-ca.crt"),
+		filepath.Join(k.workDir, ".kcp", "client-ca.key"),
+	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("unable to load client CA: %w", err)
 	}
+
+	clientCert, err := ca.NewClientCert(certs.ClientInfo{
+		Name:   user.Name,
+		Groups: user.Groups,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("unable to create client certificate for %s: %w", user.Name, err)
+	}
+
+	crt, key, err := clientCert.AsBytes()
+	if err != nil {
+		return nil, fmt.Errorf("unable to serialize client certificate for %s: %w", user.Name, err)
+	}
+
+	restCfg, err := k.RESTConfig()
+	if err != nil {
+		return nil, fmt.Errorf("unable to load base REST config: %w", err)
+	}
+
+	if baseConfig != nil {
+		restCfg.QPS = baseConfig.QPS
+		restCfg.Burst = baseConfig.Burst
+	}
+	restCfg.CertData = crt
+	restCfg.KeyData = key
 
 	return &AuthenticatedUser{
-		cfg:   cfg,
-		plane: f,
+		cfg:  restCfg,
+		kcp:  k,
+		name: user.Name,
 	}, nil
 }
 
-// GetRootShard returns this Kcp's Shard, initializing it if necessary.
-func (f *Kcp) GetRootShard() *Shard {
-	if f.RootShard == nil {
-		f.RootShard = &Shard{}
+func (k *Kcp) waitForReady() error {
+	readyFile := filepath.Join(k.workDir, ".kcp", "ready-to-test")
+	ctx, cancel := context.WithTimeout(context.Background(), k.StartTimeout)
+	defer cancel()
+
+	return wait.PollUntilContextCancel(ctx, 200*time.Millisecond, true, func(ctx context.Context) (bool, error) {
+		// Check if process has exited.
+		if k.cmd.ProcessState != nil {
+			return false, fmt.Errorf("sharded-test-server exited prematurely with code %d", k.cmd.ProcessState.ExitCode())
+		}
+		_, err := os.Stat(readyFile)
+		return err == nil, nil
+	})
+}
+
+func (k *Kcp) buildEnv() []string {
+	env := os.Environ()
+
+	// Ensure NO_GORUN is set so sharded-test-server looks for binaries in PATH
+	// instead of trying `go run`.
+	env = setEnv(env, "NO_GORUN", "true")
+
+	// Build a PATH that includes the directories containing the required binaries.
+	dirs := make(map[string]struct{})
+	for _, name := range []string{"kcp", "kcp-front-proxy", "cache-server"} {
+		binPath := process.BinPathFinder(name, k.BinaryAssetsDirectory)
+		dir := filepath.Dir(binPath)
+		dirs[dir] = struct{}{}
 	}
-	return f.RootShard
+
+	currentPath := os.Getenv("PATH")
+	newPath := strings.Join(append(slices.Collect(maps.Keys(dirs)), currentPath), string(os.PathListSeparator))
+	env = setEnv(env, "PATH", newPath)
+
+	return env
+}
+
+func setEnv(env []string, key, value string) []string {
+	prefix := key + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }

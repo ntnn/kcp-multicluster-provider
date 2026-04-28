@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package process_test
+package process
 
 import (
 	"testing"
@@ -23,8 +23,7 @@ import (
 	. "github.com/onsi/gomega"
 )
 
-func TestInternal(t *testing.T) {
-	t.Parallel()
+func TestProcess(t *testing.T) {
 	RegisterFailHandler(Fail)
-	RunSpecs(t, "Envtest Process Launcher Suite")
+	RunSpecs(t, "Process Suite")
 }

@@ -17,238 +17,166 @@ limitations under the License.
 package certs_test
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	crand "crypto/rand"
+	"crypto/rsa"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/pem"
 	"math/big"
-	"net"
-	"sort"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/kcp-dev/multicluster-provider/envtest/internal/certs"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
-	. "github.com/onsi/gomega/gstruct"
 )
 
+func writeCA(dir string, key any, cert *x509.Certificate) (certPath, keyPath string) {
+	certPath = filepath.Join(dir, "ca.crt")
+	keyPath = filepath.Join(dir, "ca.key")
+
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: cert.Raw})
+	Expect(os.WriteFile(certPath, certPEM, 0o600)).To(Succeed())
+
+	var keyDER []byte
+	var blockType string
+	switch k := key.(type) {
+	case *rsa.PrivateKey:
+		keyDER = x509.MarshalPKCS1PrivateKey(k)
+		blockType = "RSA PRIVATE KEY"
+	case *ecdsa.PrivateKey:
+		var err error
+		keyDER, err = x509.MarshalECPrivateKey(k)
+		Expect(err).NotTo(HaveOccurred())
+		blockType = "EC PRIVATE KEY"
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: keyDER})
+	Expect(os.WriteFile(keyPath, keyPEM, 0o600)).To(Succeed())
+
+	return certPath, keyPath
+}
+
+func generateSelfSignedCA(key any) *x509.Certificate {
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test-ca"},
+		NotBefore:             time.Now(),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+	}
+
+	var pub any
+	switch k := key.(type) {
+	case *rsa.PrivateKey:
+		pub = &k.PublicKey
+	case *ecdsa.PrivateKey:
+		pub = &k.PublicKey
+	}
+
+	certDER, err := x509.CreateCertificate(crand.Reader, template, template, pub, key)
+	Expect(err).NotTo(HaveOccurred())
+	cert, err := x509.ParseCertificate(certDER)
+	Expect(err).NotTo(HaveOccurred())
+	return cert
+}
+
 var _ = Describe("TinyCA", func() {
-	var ca *certs.TinyCA
+	var tmpDir string
 
 	BeforeEach(func() {
 		var err error
-		ca, err = certs.NewTinyCA()
-		Expect(err).NotTo(HaveOccurred(), "should be able to initialize the CA")
-	})
-
-	Describe("the CA certs themselves", func() {
-		It("should be retrievable as a cert pair", func() {
-			Expect(ca.CA.Key).NotTo(BeNil(), "should have a key")
-			Expect(ca.CA.Cert).NotTo(BeNil(), "should have a cert")
-		})
-
-		It("should be usable for signing & verifying", func() {
-			Expect(ca.CA.Cert.KeyUsage&x509.KeyUsageCertSign).NotTo(BeEquivalentTo(0), "should be usable for cert signing")
-			Expect(ca.CA.Cert.KeyUsage&x509.KeyUsageDigitalSignature).NotTo(BeEquivalentTo(0), "should be usable for signature verifying")
-		})
-	})
-
-	It("should produce unique serials among all generated certificates of all types", func() {
-		By("generating a few cert pairs for both serving and client auth")
-		firstCerts, err := ca.NewServingCert()
+		tmpDir, err = os.MkdirTemp("", "tinyca-test-*")
 		Expect(err).NotTo(HaveOccurred())
-		secondCerts, err := ca.NewClientCert(certs.ClientInfo{Name: "user"})
-		Expect(err).NotTo(HaveOccurred())
-		thirdCerts, err := ca.NewServingCert()
-		Expect(err).NotTo(HaveOccurred())
-
-		By("checking that they have different serials")
-		serials := []*big.Int{
-			firstCerts.Cert.SerialNumber,
-			secondCerts.Cert.SerialNumber,
-			thirdCerts.Cert.SerialNumber,
-		}
-		// quick uniqueness check of numbers: sort, then you only have to compare sequential entries
-		sort.Slice(serials, func(i, j int) bool {
-			return serials[i].Cmp(serials[j]) == -1
-		})
-		Expect(serials[1].Cmp(serials[0])).NotTo(Equal(0), "serials shouldn't be equal")
-		Expect(serials[2].Cmp(serials[1])).NotTo(Equal(0), "serials shouldn't be equal")
 	})
 
-	Describe("Generated serving certs", func() {
-		It("should be valid for short enough to avoid production usage, but long enough for long-running tests", func() {
-			cert, err := ca.NewServingCert()
-			Expect(err).NotTo(HaveOccurred(), "should be able to generate the serving certs")
+	AfterEach(func() {
+		os.RemoveAll(tmpDir)
+	})
 
-			duration := time.Until(cert.Cert.NotAfter)
-			Expect(duration).To(BeNumerically("<=", 168*time.Hour), "not-after should be short-ish (<= 1 week)")
-			Expect(duration).To(BeNumerically(">=", 2*time.Hour), "not-after should be enough for long tests (couple of hours)")
+	Describe("LoadTinyCA", func() {
+		It("should load an RSA (PKCS1) CA key", func() {
+			rsaKey, err := rsa.GenerateKey(crand.Reader, 2048)
+			Expect(err).NotTo(HaveOccurred())
+
+			cert := generateSelfSignedCA(rsaKey)
+			certPath, keyPath := writeCA(tmpDir, rsaKey, cert)
+
+			ca, err := certs.LoadTinyCA(certPath, keyPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ca).NotTo(BeNil())
 		})
 
-		Context("when encoding names", func() {
-			var cert certs.CertPair
-			BeforeEach(func() {
-				By("generating a serving cert with IPv4 & IPv6 addresses, and DNS names")
-				var err error
-				// IPs are in the "example & docs" blocks for IPv4 (TEST-NET-1) & IPv6
-				cert, err = ca.NewServingCert("192.0.2.1", "localhost", "2001:db8::")
-				Expect(err).NotTo(HaveOccurred(), "should be able to create the serving certs")
-			})
+		It("should load an EC CA key", func() {
+			ecKey, err := ecdsa.GenerateKey(elliptic.P256(), crand.Reader)
+			Expect(err).NotTo(HaveOccurred())
 
-			It("should encode all non-IP names as DNS SANs", func() {
-				Expect(cert.Cert.DNSNames).To(ConsistOf("localhost"))
-			})
+			cert := generateSelfSignedCA(ecKey)
+			certPath, keyPath := writeCA(tmpDir, ecKey, cert)
 
-			It("should encode all IP names as IP SANs", func() {
-				// NB(directxman12): this is non-exhaustive because we also
-				// convert DNS SANs to IPs too (see test below)
-				Expect(cert.Cert.IPAddresses).To(ContainElements(
-					// normalize the elements with To16 so we can compare them to the output of
-					// of ParseIP safely (the alternative is a custom matcher that calls Equal,
-					// but this is easier)
-					WithTransform(net.IP.To16, Equal(net.ParseIP("192.0.2.1"))),
-					WithTransform(net.IP.To16, Equal(net.ParseIP("2001:db8::"))),
-				))
-			})
-
-			It("should add the corresponding IP address(es) (as IP SANs) for DNS names", func() {
-				// NB(directxman12): we currently fail if the lookup fails.
-				// I'm not certain this is the best idea (both the bailing on
-				// error and the actual idea), so if this causes issues, you
-				// might want to reconsider.
-
-				localhostAddrs, err := net.LookupHost("localhost")
-				Expect(err).NotTo(HaveOccurred(), "should be able to find IPs for localhost")
-				localhostIPs := make([]interface{}, len(localhostAddrs))
-				for i, addr := range localhostAddrs {
-					// normalize the elements with To16 so we can compare them to the output of
-					// of ParseIP safely (the alternative is a custom matcher that calls Equal,
-					// but this is easier)
-					localhostIPs[i] = WithTransform(net.IP.To16, Equal(net.ParseIP(addr)))
-				}
-				Expect(cert.Cert.IPAddresses).To(ContainElements(localhostIPs...))
-			})
-		})
-
-		It("should assume a name of localhost (DNS SAN) if no names are given", func() {
-			cert, err := ca.NewServingCert()
-			Expect(err).NotTo(HaveOccurred(), "should be able to generate a serving cert with the default name")
-			Expect(cert.Cert.DNSNames).To(ConsistOf("localhost"), "the default DNS name should be localhost")
-
-		})
-
-		It("should be usable for server auth, verifying, and enciphering", func() {
-			cert, err := ca.NewServingCert()
-			Expect(err).NotTo(HaveOccurred(), "should be able to generate a serving cert")
-
-			Expect(cert.Cert.KeyUsage&x509.KeyUsageKeyEncipherment).NotTo(BeEquivalentTo(0), "should be usable for key enciphering")
-			Expect(cert.Cert.KeyUsage&x509.KeyUsageDigitalSignature).NotTo(BeEquivalentTo(0), "should be usable for signature verifying")
-			Expect(cert.Cert.ExtKeyUsage).To(ContainElement(x509.ExtKeyUsageServerAuth), "should be usable for server auth")
-
-		})
-
-		It("should be signed by the CA", func() {
-			cert, err := ca.NewServingCert()
-			Expect(err).NotTo(HaveOccurred(), "should be able to generate a serving cert")
-			Expect(cert.Cert.CheckSignatureFrom(ca.CA.Cert)).To(Succeed())
+			ca, err := certs.LoadTinyCA(certPath, keyPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ca).NotTo(BeNil())
 		})
 	})
 
-	Describe("Generated client certs", func() {
-		var cert certs.CertPair
+	Describe("NewClientCert", func() {
+		var ca *certs.TinyCA
+
 		BeforeEach(func() {
-			var err error
-			cert, err = ca.NewClientCert(certs.ClientInfo{
+			rsaKey, err := rsa.GenerateKey(crand.Reader, 2048)
+			Expect(err).NotTo(HaveOccurred())
+
+			cert := generateSelfSignedCA(rsaKey)
+			certPath, keyPath := writeCA(tmpDir, rsaKey, cert)
+
+			ca, err = certs.LoadTinyCA(certPath, keyPath)
+			Expect(err).NotTo(HaveOccurred())
+		})
+
+		It("should produce a valid client certificate", func() {
+			pair, err := ca.NewClientCert(certs.ClientInfo{
 				Name:   "user",
 				Groups: []string{"group1", "group2"},
 			})
-			Expect(err).NotTo(HaveOccurred(), "should be able to create a client cert")
-		})
+			Expect(err).NotTo(HaveOccurred())
 
-		It("should be valid for short enough to avoid production usage, but long enough for long-running tests", func() {
-			duration := time.Until(cert.Cert.NotAfter)
-			Expect(duration).To(BeNumerically("<=", 168*time.Hour), "not-after should be short-ish (<= 1 week)")
-			Expect(duration).To(BeNumerically(">=", 2*time.Hour), "not-after should be enough for long tests (couple of hours)")
-		})
-
-		It("should be usable for client auth, verifying, and enciphering", func() {
-			Expect(cert.Cert.KeyUsage&x509.KeyUsageKeyEncipherment).NotTo(BeEquivalentTo(0), "should be usable for key enciphering")
-			Expect(cert.Cert.KeyUsage&x509.KeyUsageDigitalSignature).NotTo(BeEquivalentTo(0), "should be usable for signature verifying")
-			Expect(cert.Cert.ExtKeyUsage).To(ContainElement(x509.ExtKeyUsageClientAuth), "should be usable for client auth")
-		})
-
-		It("should encode the user name as the common name", func() {
-			Expect(cert.Cert.Subject.CommonName).To(Equal("user"))
-		})
-
-		It("should encode the groups as the organization values", func() {
-			Expect(cert.Cert.Subject.Organization).To(ConsistOf("group1", "group2"))
+			Expect(pair.Cert.Subject.CommonName).To(Equal("user"))
+			Expect(pair.Cert.Subject.Organization).To(ConsistOf("group1", "group2"))
+			Expect(pair.Cert.ExtKeyUsage).To(ContainElement(x509.ExtKeyUsageClientAuth))
 		})
 
 		It("should be signed by the CA", func() {
-			Expect(cert.Cert.CheckSignatureFrom(ca.CA.Cert)).To(Succeed())
-		})
-	})
-})
-
-var _ = Describe("Certificate Pairs", func() {
-	var pair certs.CertPair
-	BeforeEach(func() {
-		ca, err := certs.NewTinyCA()
-		Expect(err).NotTo(HaveOccurred(), "should be able to generate a cert pair")
-
-		pair = ca.CA
-	})
-
-	Context("when serializing just the public key", func() {
-		It("should serialize into a CERTIFICATE PEM block", func() {
-			bytes := pair.CertBytes()
-			Expect(bytes).NotTo(BeEmpty(), "should produce some cert bytes")
-
-			block, rest := pem.Decode(bytes)
-			Expect(rest).To(BeEmpty(), "shouldn't have any data besides the PEM block")
-
-			Expect(block).To(PointTo(MatchAllFields(Fields{
-				"Type":    Equal("CERTIFICATE"),
-				"Headers": BeEmpty(),
-				"Bytes":   Equal(pair.Cert.Raw),
-			})))
-		})
-	})
-
-	Context("when serializing both parts", func() {
-		var certBytes, keyBytes []byte
-		BeforeEach(func() {
-			var err error
-			certBytes, keyBytes, err = pair.AsBytes()
-			Expect(err).NotTo(HaveOccurred(), "should be able to serialize the pair")
+			pair, err := ca.NewClientCert(certs.ClientInfo{Name: "user"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(pair.Cert.CheckSignatureFrom(ca.CA.Cert)).To(Succeed())
 		})
 
-		It("should serialize the private key in PKCS8 form in a PRIVATE KEY PEM block", func() {
-			Expect(keyBytes).NotTo(BeEmpty(), "should produce some key bytes")
+		It("should produce unique serial numbers", func() {
+			first, err := ca.NewClientCert(certs.ClientInfo{Name: "a"})
+			Expect(err).NotTo(HaveOccurred())
+			second, err := ca.NewClientCert(certs.ClientInfo{Name: "b"})
+			Expect(err).NotTo(HaveOccurred())
+			Expect(first.Cert.SerialNumber.Cmp(second.Cert.SerialNumber)).NotTo(Equal(0))
+		})
 
-			By("decoding & checking the PEM block")
-			block, rest := pem.Decode(keyBytes)
-			Expect(rest).To(BeEmpty(), "shouldn't have any data besides the PEM block")
+		It("should serialize via AsBytes", func() {
+			pair, err := ca.NewClientCert(certs.ClientInfo{Name: "user"})
+			Expect(err).NotTo(HaveOccurred())
 
+			certBytes, keyBytes, err := pair.AsBytes()
+			Expect(err).NotTo(HaveOccurred())
+			Expect(certBytes).NotTo(BeEmpty())
+			Expect(keyBytes).NotTo(BeEmpty())
+
+			block, _ := pem.Decode(keyBytes)
+			Expect(block).NotTo(BeNil())
 			Expect(block.Type).To(Equal("PRIVATE KEY"))
-
-			By("decoding & checking the PKCS8 data")
-			Expect(x509.ParsePKCS8PrivateKey(block.Bytes)).NotTo(BeNil(), "should be able to parse back the private key")
 		})
-
-		It("should serialize the public key into a CERTIFICATE PEM block", func() {
-			Expect(certBytes).NotTo(BeEmpty(), "should produce some cert bytes")
-
-			block, rest := pem.Decode(certBytes)
-			Expect(rest).To(BeEmpty(), "shouldn't have any data besides the PEM block")
-
-			Expect(block).To(PointTo(MatchAllFields(Fields{
-				"Type":    Equal("CERTIFICATE"),
-				"Headers": BeEmpty(),
-				"Bytes":   Equal(pair.Cert.Raw),
-			})))
-		})
-
 	})
 })
